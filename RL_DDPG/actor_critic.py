@@ -1,174 +1,143 @@
 """
-Creates RL algorithm classes
+Create Actor and Critic for Deep Deterministic Policy Gradient RL method
 
 Author: Benjamin Bowes
 Date: May 10, 2019
 
-Based on code from:
-https://github.com/kLabUM/rl-storm-control/blob/master/flux_training_code/flux_version_system_run/pond_net.py
-and
-https://github.com/germain-hug/Deep-RL-Keras/blob/master/DDPG/actor.py
+Originally based on code from Hugo Germain:
+https://github.com/germain-hug/Deep-RL-Keras/tree/master/DDPG
 """
 
 import numpy as np
-from keras.models import Sequential
-from keras.layers import Input, Dense, Reshape, Lambda, BatchNormalization, GaussianNoise, Flatten, Activation, Dropout
-from keras.optimizers import RMSprop, Adam
+import tensorflow as tf
+import keras.backend as K
 from keras.initializers import RandomUniform
+from keras.models import Model
+from keras.optimizers import Adam
+from keras.layers import Input, Dense, concatenate, Reshape, LSTM, Lambda, BatchNormalization, GaussianNoise, Flatten
 
-np.random.seed(1)
 
-
-class Actor:  # Actor Network for the DDPG Algorithm
-    def __init__(self, action_value_model, target_model, states_len, replay_memory, policy, tau,
-                 batch_size=64, target_update=10000, train=True):
-
-        self.states_len = states_len
-        self.ac_model = action_value_model
-        self.target_model = target_model
-        self.replay = replay_memory
-        self.batch_size = batch_size
-        self.policy = policy
-        self.train = train
-        self.target_update = target_update
+class Actor:
+    def __init__(self, inp_dim, out_dim, act_range, lr, tau):
+        self.env_dim = inp_dim
+        self.act_dim = out_dim
+        self.act_range = act_range
         self.tau = tau
+        self.lr = lr
+        self.model = self.network()
+        self.target_model = self.network()
+        self.adam_optimizer = self.optimizer()
 
-        self.state_vector = np.zeros((1, self.states_len))
-        self.state_new_vector = np.zeros((1, self.states_len))
-        self.rewards_vector = np.zeros(1)
-        self.terminal_vector = np.zeros(1)
-        self.action_vector = np.zeros(1)
+    def network(self):
+        """
+        Actor Network for Policy function Approximation, using a tanh
+        activation for continuous control. We add parameter noise to encourage
+        exploration, and balance it with Layer Normalization.
+        """
+        inp = Input(shape=self.env_dim)
 
-        self.training_batch = {'states': np.zeros((self.batch_size,
-                                                   self.states_len)),
-                               'states_new': np.zeros((self.batch_size,
-                                                       self.states_len)),
-                               'actions': np.zeros((self.batch_size, 1)),
-                               'rewards': np.zeros((self.batch_size, 1)),
-                               'terminal': np.zeros((self.batch_size, 1))}
+        x = Dense(100, activation='relu')(inp)
+        x = GaussianNoise(1.0)(x)
 
-    def _random_sample(self):
-        indx = randombatch(self.batch_size, len(self.replay['states'].data()))
-        for i in self.training_batch.keys():
-            temp = self.replay[i].data()
-            self.training_batch[i] = temp[indx]
+        # x = Flatten()(x)
+        x = Dense(100, activation='relu')(x)
+        x = GaussianNoise(1.0)(x)
 
-    def _update_target_model(self):  # transfer weights to target model with a factor of tau
-        W, target_W = self.ac_model.get_weights(), self.target_model.get_weights()
+        out = Dense(self.act_dim, activation='sigmoid', kernel_initializer=RandomUniform())(x)
+        # out = Lambda(lambda i: i * self.act_range)(out)  # sigmoid scales to (0,1) so don't need to adjust range
+
+        return Model(inp, out)
+
+    def predict(self, state):
+        """ Action prediction
+        """
+        return self.model.predict(np.expand_dims(state, axis=0))
+
+    def target_predict(self, inp):
+        """ Action prediction (target network)
+        """
+        return self.target_model.predict(inp)
+
+    def transfer_weights(self):
+        """ Transfer model weights to target model with a factor of Tau
+        """
+        W, target_W = self.model.get_weights(), self.target_model.get_weights()
         for i in range(len(W)):
             target_W[i] = self.tau * W[i] + (1 - self.tau) * target_W[i]
         self.target_model.set_weights(target_W)
 
-    def _train(self):
-        temp_states_new = self.training_batch['states_new']
-        temp_states = self.training_batch['states']
-        temp_rewards = self.training_batch['rewards']
-        temp_terminal = self.training_batch['terminal']
-        temp_actions = self.training_batch['actions']
-        q_values_train_next = self.target_model.predict_on_batch(temp_states_new)
-        target = self.ac_model.predict_on_batch(temp_states)
-        for i in range(self.batch_size):
-            action_idx = int(temp_actions[i])
-            if temp_terminal[i]:
-                target[i][action_idx] = temp_rewards[i]
-            else:
-                target[i][action_idx] = temp_rewards[i] + 0.99 * np.max(
-                    q_values_train_next[i])
+    def train(self, states, actions, grads):
+        """ Actor Training
+        """
+        self.adam_optimizer([states, grads])
 
-        self.ac_model.fit(temp_states, target, batch_size=64, epochs=1, verbose=0)
+    def optimizer(self):
+        """ Actor Optimizer
+        """
+        action_gdts = K.placeholder(shape=(None, self.act_dim))
+        params_grad = tf.gradients(self.model.output, self.model.trainable_weights, -action_gdts)  # gradients are made negative here for gradient ascent
+        grads = zip(params_grad, self.model.trainable_weights)
+        return K.function([self.model.input, action_gdts], [tf.train.AdamOptimizer(self.lr).apply_gradients(grads)][1:])
 
-    def train_q(self, update):
-        self._random_sample()
-        if update:
-            self._update_target_model()
-        self._train()
+    def save(self, path):
+        self.model.save_weights(path + '_actor.h5')
+
+    def load_weights(self, path):
+        self.model.load_weights(path)
 
 
-class Critic:  # Critic Network for the DDPG Algorithm
-    def __init__(self, action_value_model, target_model, states_len, replay_memory, policy, tau,
-                 batch_size=64, target_update=10000, train=True):
+class Critic:
+    def __init__(self, inp_dim, out_dim, lr, tau):
+        # Dimensions and Hyperparams
+        self.env_dim = inp_dim
+        self.act_dim = out_dim
+        self.tau, self.lr = tau, lr
+        # Build critic and target models
+        self.model = self.network()
+        self.target_model = self.network()
+        self.model.compile(Adam(self.lr), 'mse')
+        self.target_model.compile(Adam(self.lr), 'mse')
+        # Function to compute Q-value gradients (Actor Optimization)
+        self.action_grads = K.function([self.model.input[0], self.model.input[1]], K.gradients(self.model.output,
+                                                                                               [self.model.input[1]]))
 
-        self.states_len = states_len
-        self.ac_model = action_value_model
-        self.target_model = target_model
-        self.replay = replay_memory
-        self.batch_size = batch_size
-        self.policy = policy
-        self.train = train
-        self.target_update = target_update
-        self.tau = tau
+    def network(self):
+        """ Assemble Critic network to predict q-values
+        """
+        state = Input(self.env_dim)
+        action = Input((self.act_dim,))
+        x = Dense(200, activation='relu')(state)
+        # x = concatenate([Flatten()(x), action])
+        x = concatenate([x, action])
+        x = Dense(200, activation='relu')(x)
+        out = Dense(1, activation='linear', kernel_initializer=RandomUniform())(x)
+        return Model([state, action], out)
 
-        self.state_vector = np.zeros((1, self.states_len))
-        self.state_new_vector = np.zeros((1, self.states_len))
-        self.rewards_vector = np.zeros(1)
-        self.terminal_vector = np.zeros(1)
-        self.action_vector = np.zeros(1)
+    def gradients(self, states, actions):
+        """ Compute Q-value gradients w.r.t. states and policy-actions
+        """
+        return self.action_grads([states, actions])
 
-        self.training_batch = {'states': np.zeros((self.batch_size,
-                                                   self.states_len)),
-                               'states_new': np.zeros((self.batch_size,
-                                                       self.states_len)),
-                               'actions': np.zeros((self.batch_size, 1)),
-                               'rewards': np.zeros((self.batch_size, 1)),
-                               'terminal': np.zeros((self.batch_size, 1))}
+    def target_predict(self, inp):
+        """ Predict Q-Values using the target network
+        """
+        return self.target_model.predict(inp)
 
-    def _random_sample(self):
-        indx = randombatch(self.batch_size, len(self.replay['states'].data()))
-        for i in self.training_batch.keys():
-            temp = self.replay[i].data()
-            self.training_batch[i] = temp[indx]
+    def train_on_batch(self, states, actions, critic_target):
+        """ Train the critic network on batch of sampled experience
+        """
+        return self.model.train_on_batch([states, actions], critic_target)
 
-    def _update_target_model(self):  # transfer weights to target model with a factor of tau
-        W, target_W = self.ac_model.get_weights(), self.target_model.get_weights()
+    def transfer_weights(self):
+        """ Transfer model weights to target model with a factor of Tau
+        """
+        W, target_W = self.model.get_weights(), self.target_model.get_weights()
         for i in range(len(W)):
             target_W[i] = self.tau * W[i] + (1 - self.tau) * target_W[i]
         self.target_model.set_weights(target_W)
 
-    def _train(self):
-        temp_states_new = self.training_batch['states_new']
-        temp_states = self.training_batch['states']
-        temp_rewards = self.training_batch['rewards']
-        temp_terminal = self.training_batch['terminal']
-        temp_actions = self.training_batch['actions']
-        q_values_train_next = self.target_model.predict_on_batch(temp_states_new)
-        target = self.ac_model.predict_on_batch(temp_states)
-        for i in range(self.batch_size):
-            action_idx = int(temp_actions[i])
-            if temp_terminal[i]:
-                target[i][action_idx] = temp_rewards[i]
-            else:
-                target[i][action_idx] = temp_rewards[i] + 0.99 * np.max(
-                    q_values_train_next[i])
+    def save(self, path):
+        self.model.save_weights(path + '_critic.h5')
 
-        self.ac_model.fit(temp_states, target, batch_size=64, epochs=1, verbose=0)
-
-    def train_q(self, update):
-        self._random_sample()
-        if update:
-            self._update_target_model()
-        self._train()
-
-
-def build_network(input_states, output_states, hidden_layers, neuron_count, activation_function, dropout):
-    # Build and initialize the neural network with a choice for dropout
-    model = Sequential()
-    model.add(Dense(neuron_count, input_dim=input_states))
-    model.add(Activation(activation_function))
-    model.add(Dropout(dropout))
-    for i_layers in range(0, hidden_layers - 1):
-        model.add(Dense(neuron_count))
-        model.add(Activation(activation_function))
-        model.add(Dropout(dropout))
-    model.add(Dense(output_states))
-    model.add(Activation('linear'))
-    sgd = RMSprop(lr=0.001, rho=0.9, epsilon=1e-08, decay=0.0)
-    model.compile(loss='mean_squared_error', optimizer=sgd)
-    return model
-
-
-def randombatch(sample_size, replay_size):
-    indx = np.linspace(0, replay_size-1, sample_size)
-    indx = np.random.choice(indx, sample_size, replace=False)
-    indx.tolist()
-    indx = list(map(int, indx))
-    return indx
+    def load_weights(self, path):
+        self.model.load_weights(path)
