@@ -4,9 +4,10 @@ import os
 
 # Read output files from different model tests
 df_dict = {}
-for file in os.listdir("RL_Class_S19/rl_project/saved_swmm_output"):
+for file in os.listdir("C:/Users/Ben Bowes/PycharmProjects/smart_stormwater_rl/RL_DDPG/saved_swmm_output"):
     file_name = str(file).split('.')[0]
-    df = pd.read_csv(os.path.join("RL_Class_S19/rl_project/saved_swmm_output", file))
+    df = pd.read_csv(os.path.join("C:/Users/Ben Bowes/PycharmProjects/smart_stormwater_rl/RL_DDPG/saved_swmm_output",
+                                  file))
     df_dict.update({file_name: df})
 
 # plot results
